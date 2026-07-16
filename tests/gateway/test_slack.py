@@ -129,6 +129,61 @@ def _redirect_cache(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# TestSlackStaticTokenAuthorization
+# ---------------------------------------------------------------------------
+
+
+class TestSlackStaticTokenAuthorization:
+    def test_oauth_autoload_env_is_hidden_from_bolt_and_restored(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CLIENT_ID", "client-id")
+        monkeypatch.setenv("SLACK_CLIENT_SECRET", "client-secret")
+        monkeypatch.setenv("SLACK_SIGNING_SECRET", "signing-secret")
+
+        constructed = object()
+        seen = {}
+
+        def fake_async_app(*, token):
+            seen["token"] = token
+            seen["client_id_present"] = "SLACK_CLIENT_ID" in os.environ
+            seen["client_secret_present"] = "SLACK_CLIENT_SECRET" in os.environ
+            seen["signing_secret"] = os.environ.get("SLACK_SIGNING_SECRET")
+            return constructed
+
+        monkeypatch.setattr(_slack_mod, "AsyncApp", fake_async_app)
+
+        result = _slack_mod._create_static_token_app("xoxb-fake")
+
+        assert result is constructed
+        assert seen == {
+            "token": "xoxb-fake",
+            "client_id_present": False,
+            "client_secret_present": False,
+            "signing_secret": "signing-secret",
+        }
+        assert os.environ["SLACK_CLIENT_ID"] == "client-id"
+        assert os.environ["SLACK_CLIENT_SECRET"] == "client-secret"
+        assert os.environ["SLACK_SIGNING_SECRET"] == "signing-secret"
+
+    def test_oauth_autoload_env_is_restored_when_constructor_fails(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CLIENT_ID", "client-id")
+        monkeypatch.setenv("SLACK_CLIENT_SECRET", "client-secret")
+
+        def fail_async_app(*, token):
+            assert token == "xoxb-fake"
+            assert "SLACK_CLIENT_ID" not in os.environ
+            assert "SLACK_CLIENT_SECRET" not in os.environ
+            raise RuntimeError("constructor failed")
+
+        monkeypatch.setattr(_slack_mod, "AsyncApp", fail_async_app)
+
+        with pytest.raises(RuntimeError, match="constructor failed"):
+            _slack_mod._create_static_token_app("xoxb-fake")
+
+        assert os.environ["SLACK_CLIENT_ID"] == "client-id"
+        assert os.environ["SLACK_CLIENT_SECRET"] == "client-secret"
+
+
+# ---------------------------------------------------------------------------
 # TestSlashCommandSessionIsolation
 # ---------------------------------------------------------------------------
 

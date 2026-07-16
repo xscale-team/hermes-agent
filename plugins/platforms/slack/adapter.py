@@ -63,6 +63,34 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 logger = logging.getLogger(__name__)
 
+_SLACK_OAUTH_AUTOLOAD_ENV = ("SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET")
+
+
+def _create_static_token_app(token: str):
+    """Build a single-install Bolt app without ambient OAuth auto-detection.
+
+    Slack Bolt automatically enables OAuth/multi-team authorization whenever
+    both ``SLACK_CLIENT_ID`` and ``SLACK_CLIENT_SECRET`` exist in the process
+    environment.  In a Socket Mode runtime that supplies an explicit bot token,
+    that silently discards the token and routes inbound events through an
+    installation store instead.  A stale OAuth setup value can therefore stop
+    all replies even while ``auth.test`` and ``apps.connections.open`` pass.
+
+    Hermes' Slack adapter uses explicit static bot tokens, including its
+    multi-workspace token list.  Hide only Bolt's OAuth auto-load variables for
+    the synchronous constructor call, then restore the parent environment.
+    """
+
+    saved_oauth_env = {
+        key: os.environ.pop(key)
+        for key in _SLACK_OAUTH_AUTOLOAD_ENV
+        if key in os.environ
+    }
+    try:
+        return AsyncApp(token=token)  # type: ignore[call-arg]
+    finally:
+        os.environ.update(saved_oauth_env)
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -1073,7 +1101,7 @@ class SlackAdapter(BasePlatformAdapter):
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
-            self._app = AsyncApp(token=primary_token)
+            self._app = _create_static_token_app(primary_token)
             _apply_slack_proxy(self._app.client, proxy_url)
 
             # Register each bot token and map team_id → client
