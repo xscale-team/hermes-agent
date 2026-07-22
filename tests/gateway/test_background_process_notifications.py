@@ -9,6 +9,7 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 
 import asyncio
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -202,6 +203,37 @@ async def test_run_process_watcher_respects_notification_mode(
     if expected_fragment is not None:
         sent_message = adapter.send.await_args.args[1]
         assert expected_fragment in sent_message
+
+
+@pytest.mark.asyncio
+async def test_off_suppresses_notify_on_complete_injection(monkeypatch, tmp_path):
+    """Off is absolute: agent-requested completion must not re-enter chat."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="RAW_CLIENT_MARKER\n",
+        exited=True,
+        exit_code=0,
+        command="python worker.py",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "off")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    watcher = _watcher_dict()
+    watcher.update({
+        "session_key": "agent:main:telegram:dm:123",
+        "notify_on_complete": True,
+    })
+
+    await runner._run_process_watcher(watcher)
+
+    cast(AsyncMock, adapter.send).assert_not_awaited()
+    cast(AsyncMock, adapter.handle_message).assert_not_awaited()
 
 
 @pytest.mark.asyncio
