@@ -759,6 +759,35 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     agent = session.get("agent")
     lock = session.get("history_lock")
+
+    # A close/finalize is terminal authority for the in-flight turn. Mark the
+    # session cancelled and request the same hard interrupt used by the Stop
+    # RPC before persisting or releasing the live-session record. Without this,
+    # session.close could pop a running session while its run thread continued
+    # launching tools under an orphaned durable session key.
+    if lock is not None:
+        with lock:
+            session["_turn_cancel_requested"] = True
+            session["queued_prompt"] = None
+            session.pop("queued_prompts", None)
+            session["_queued_prompt_generation"] = int(
+                session.get("_queued_prompt_generation", 0)
+            ) + 1
+    else:
+        session["_turn_cancel_requested"] = True
+        session["queued_prompt"] = None
+        session.pop("queued_prompts", None)
+        session["_queued_prompt_generation"] = int(
+            session.get("_queued_prompt_generation", 0)
+        ) + 1
+    if session.get("running") and agent is not None:
+        try:
+            from agent.interrupt_compat import request_hard_interrupt
+
+            request_hard_interrupt(agent)
+        except Exception:
+            logger.debug("Failed to interrupt running session during finalize", exc_info=True)
+
     if lock is not None:
         with lock:
             history = list(session.get("history", []))
