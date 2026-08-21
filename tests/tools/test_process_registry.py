@@ -383,6 +383,52 @@ def test_reader_loop_still_replaces_genuinely_invalid_bytes(registry, monkeypatc
     assert session.output_buffer == "ok\ufffddone\n"
 
 
+def test_reader_loop_does_not_false_exit_when_stdout_closes_before_process(
+    registry, monkeypatch,
+):
+    """Closed stdout is not process exit while Popen.wait() still blocks."""
+
+    class _EarlyClosedProcess:
+        def __init__(self):
+            self.stdout = _FakeChunkStdout([b""])
+            self.returncode = None
+            self.wait_called = threading.Event()
+            self.done = threading.Event()
+
+        def wait(self, timeout=None):
+            self.wait_called.set()
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("early-closed", timeout)
+            assert self.done.wait(timeout=2)
+            self.returncode = 0
+            return 0
+
+    session = _make_session(sid="proc_stdout_closed_early")
+    process = _EarlyClosedProcess()
+    session.process = process
+    registry._running[session.id] = session
+    moved = []
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: moved.append(_s.id))
+
+    reader = threading.Thread(target=registry._reader_loop, args=(session,))
+    reader.start()
+    assert process.wait_called.wait(timeout=1)
+    time.sleep(0.05)
+
+    assert session.exited is False
+    assert session.exit_code is None
+    assert moved == []
+
+    process.done.set()
+    reader.join(timeout=2)
+    assert not reader.is_alive()
+    assert session.exited is True
+    assert session.exit_code == 0
+    assert moved == [session.id]
+
+
 def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry, monkeypatch):
     """The PTY reader gets the same incremental-decode treatment."""
 

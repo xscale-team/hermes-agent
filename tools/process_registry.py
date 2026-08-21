@@ -1432,15 +1432,21 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
-            # Always reap the child to prevent zombie processes.
+            # Always reap the direct child before reporting completion. Stdout
+            # may close while the child is still running; a timed wait followed
+            # by unconditional finalization produced false ``exited`` results
+            # with ``exit_code=None`` and left the real process alive.
             try:
-                session.process.wait(timeout=5)
+                return_code = session.process.wait()
             except Exception as e:
-                logger.debug("Process wait timed out or failed: %s", e)
-            session.exited = True
-            if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
-                session.completion_reason = "exited"
+                logger.debug("Process wait failed: %s", e)
+                self._reconcile_local_exit(session)
+                return
+            with session._lock:
+                session.exited = True
+                if session.completion_reason != "killed":
+                    session.exit_code = return_code
+                    session.completion_reason = "exited"
             self._move_to_finished(session)
 
     def _env_poller_loop(
