@@ -106,6 +106,27 @@ class TestFinalizeSessionPersist:
 
         agent.commit_memory_session.assert_called_once()
 
+    @patch("agent.interrupt_compat.request_hard_interrupt")
+    def test_running_turn_is_hard_interrupted_before_finalize(self, hard_interrupt):
+        """Closing a running session must stop its orphaned run thread."""
+        from tui_gateway.server import _finalize_session
+
+        agent = _make_agent()
+        session = _make_session(agent=agent, history=[{"role": "user", "content": "x"}])
+        session.update({
+            "running": True,
+            "queued_prompt": "launch another deploy",
+            "queued_prompts": ["launch another deploy"],
+            "_queued_prompt_generation": 4,
+        })
+
+        _finalize_session(session, end_reason="tui_close")
+
+        hard_interrupt.assert_called_once_with(agent)
+        assert session["_turn_cancel_requested"] is True
+        assert session["queued_prompt"] is None
+        assert "queued_prompts" not in session
+        assert session["_queued_prompt_generation"] == 5
 
     def test_empty_history_skips_persist(self):
         """Empty history → _persist_session not called (guard)."""
