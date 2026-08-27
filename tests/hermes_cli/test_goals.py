@@ -60,6 +60,18 @@ class TestParseJudgeResponse:
         assert wait == {"pid": 4242}
         assert reason == "CI running"
 
+    def test_blocked_verdict_is_not_collapsed_into_done(self):
+        from hermes_cli.goals import _parse_judge_response
+
+        verdict, reason, progress_failed, wait = _parse_judge_response(
+            '{"verdict": "blocked", "reason": "needs user OAuth"}'
+        )
+
+        assert verdict == "blocked"
+        assert reason == "needs user OAuth"
+        assert progress_failed is False
+        assert wait is None
+
 
 
 
@@ -116,6 +128,62 @@ class TestGoalManager:
         assert mgr.is_active()
         assert "active" in mgr.status_line().lower()
         assert "port the thing" in mgr.status_line()
+
+    def test_blocked_judge_pauses_without_delivering_goal(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="blocked-goal", default_max_turns=900)
+        mgr.set("complete OAuth and verify the account", max_turns=900)
+
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("blocked", "needs user OAuth", False, None, False),
+        ):
+            decision = mgr.evaluate_after_turn("Opened the OAuth login gate.")
+
+        assert decision["should_continue"] is False
+        assert decision["status"] == "paused"
+        assert mgr.state.status == "paused"
+        assert mgr.state.max_turns == 900
+        assert mgr.state.turns_used == 1
+        assert mgr.state.paused_reason == "blocked: needs user OAuth"
+
+    def test_real_user_turn_reactivates_done_or_blocked_goal_without_lowering_budget(
+        self, hermes_home
+    ):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="reactivate-goal", default_max_turns=900)
+        mgr.set("ship and verify the feature", max_turns=900)
+        mgr.state.turns_used = 87
+        mgr.mark_done("first delivery claim")
+
+        assert mgr.reactivate_for_user_turn() is True
+        assert mgr.state.status == "active"
+        assert mgr.state.max_turns == 900
+        assert mgr.state.turns_used == 0
+
+        mgr.state.turns_used = 4
+        mgr.pause("blocked: needs user approval")
+
+        assert mgr.reactivate_for_user_turn() is True
+        assert mgr.state.status == "active"
+        assert mgr.state.max_turns == 900
+        # A blocked continuation is the same run, so its accounting is kept.
+        assert mgr.state.turns_used == 4
+
+        legacy = GoalManager(session_id="legacy-low-budget", default_max_turns=12)
+        legacy.set("finish a large project", max_turns=12)
+        legacy.mark_done("prematurely declared done")
+        upgraded = GoalManager(
+            session_id="legacy-low-budget", default_max_turns=1000
+        )
+
+        assert upgraded.reactivate_for_user_turn() is True
+        assert upgraded.state is not None
+        assert upgraded.state.max_turns == 1000
 
 
 

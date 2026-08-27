@@ -7349,6 +7349,62 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 session_id, exc,
             )
 
+    def record_compression_timeout_failure(
+        self,
+        session_id: str,
+        error: Optional[str] = None,
+        *,
+        now: Optional[float] = None,
+        cooldown_ladder: Tuple[int, ...] = (60, 300, 900),
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically advance one durable session's timeout cooldown ladder."""
+        if not session_id:
+            return None
+        ladder = tuple(max(1, int(value)) for value in cooldown_ladder)
+        if not ladder:
+            raise ValueError("cooldown_ladder must contain at least one duration")
+        recorded_at = time.time() if now is None else float(now)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT compression_timeout_count FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            value = (
+                row["compression_timeout_count"]
+                if isinstance(row, sqlite3.Row)
+                else row[0]
+            )
+            timeout_count = max(0, int(value or 0)) + 1
+            cooldown_seconds = ladder[min(timeout_count, len(ladder)) - 1]
+            cooldown_until = recorded_at + cooldown_seconds
+            cursor = conn.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = ?, "
+                "compression_failure_error = ?, compression_timeout_count = ? "
+                "WHERE id = ?",
+                (cooldown_until, error, timeout_count, session_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return {
+                "timeout_count": timeout_count,
+                "cooldown_seconds": cooldown_seconds,
+                "cooldown_until": cooldown_until,
+                "error": error,
+            }
+
+        try:
+            return self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "record_compression_timeout_failure(%s) failed: %s",
+                session_id,
+                exc,
+            )
+            return None
+
     def get_compression_failure_cooldown(
         self,
         session_id: str,
@@ -7359,8 +7415,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
         with self._lock:
             row = self._conn.execute(
-                "SELECT compression_failure_cooldown_until, compression_failure_error "
-                "FROM sessions WHERE id = ?",
+                "SELECT compression_failure_cooldown_until, compression_failure_error, "
+                "compression_timeout_count FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
         if row is None:
@@ -7380,10 +7436,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if isinstance(row, sqlite3.Row)
             else row[1]
         )
+        timeout_count = (
+            row["compression_timeout_count"]
+            if isinstance(row, sqlite3.Row)
+            else row[2]
+        )
         return {
             "cooldown_until": cooldown_until,
             "remaining_seconds": cooldown_until - now,
             "error": error,
+            "timeout_count": max(0, int(timeout_count or 0)),
         }
 
     def get_compression_failure_cooldown_row(
@@ -7398,15 +7460,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         API.
         """
         if not session_id:
-            return {"session_exists": False, "cooldown_until": None, "error": None}
+            return {
+                "session_exists": False,
+                "cooldown_until": None,
+                "error": None,
+                "timeout_count": 0,
+            }
         with self._lock:
             row = self._conn.execute(
-                "SELECT compression_failure_cooldown_until, compression_failure_error "
-                "FROM sessions WHERE id = ?",
+                "SELECT compression_failure_cooldown_until, compression_failure_error, "
+                "compression_timeout_count FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
         if row is None:
-            return {"session_exists": False, "cooldown_until": None, "error": None}
+            return {
+                "session_exists": False,
+                "cooldown_until": None,
+                "error": None,
+                "timeout_count": 0,
+            }
         cooldown_until = (
             row["compression_failure_cooldown_until"]
             if isinstance(row, sqlite3.Row)
@@ -7417,12 +7489,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if isinstance(row, sqlite3.Row)
             else row[1]
         )
+        timeout_count = (
+            row["compression_timeout_count"]
+            if isinstance(row, sqlite3.Row)
+            else row[2]
+        )
         return {
             "session_exists": True,
             "cooldown_until": (
                 float(cooldown_until) if cooldown_until is not None else None
             ),
             "error": error,
+            "timeout_count": max(0, int(timeout_count or 0)),
         }
 
     def restore_compression_failure_cooldown_row(
@@ -7447,12 +7525,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         deadline = snapshot.get("cooldown_until")
         error = snapshot.get("error")
+        timeout_count = max(0, int(snapshot.get("timeout_count") or 0))
 
         def _do(conn):
             cursor = conn.execute(
                 "UPDATE sessions SET compression_failure_cooldown_until = ?, "
-                "compression_failure_error = ? WHERE id = ?",
-                (deadline, error, session_id),
+                "compression_failure_error = ?, compression_timeout_count = ? "
+                "WHERE id = ?",
+                (deadline, error, timeout_count, session_id),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError(
@@ -7465,6 +7545,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "session_exists": True,
             "cooldown_until": float(deadline) if deadline is not None else None,
             "error": error,
+            "timeout_count": timeout_count,
         }
         if actual != expected:
             raise RuntimeError(
@@ -7480,7 +7561,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET compression_failure_cooldown_until = NULL, "
-                "compression_failure_error = NULL WHERE id = ?",
+                "compression_failure_error = NULL, compression_timeout_count = 0 "
+                "WHERE id = ?",
                 (session_id,),
             )
 

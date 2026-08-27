@@ -2810,23 +2810,51 @@ class ContextCompressor(ContextEngine):
             self._cooldown_persist_failed = True
             logger.debug("compression failure cooldown persist failed (non-sqlite): %s", exc)
 
-    def record_timeout_failure(self, error: str) -> None:
-        """Record a consecutive timeout failure using the shared cooldown ladder.
+    def record_timeout_failure(self, error: str) -> float:
+        """Record one timeout against the durable session cooldown ladder.
 
-        Used by both the summary-LLM exception handler (inline at line ~3714)
-        and the host-level ``compress_context`` timeout wrapper in
-        ``run_compress_context_with_progress_timeout``. Avoids re-implementing
-        the ladder at each call site (#62452).
+        The compressor object can be rebuilt between turns while the Desktop
+        session survives.  Prefer the SessionDB's atomic counter so those
+        rebuilds cannot reset escalation to the first rung.  The in-memory path
+        remains as a safe fallback for ephemeral or database-less agents.
         """
-        _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
+        cooldown_ladder = (60, 300, 900)
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        recorder = getattr(session_db, "record_compression_timeout_failure", None)
+        if session_id and callable(recorder):
+            try:
+                state = recorder(
+                    session_id,
+                    error,
+                    now=time.time(),
+                    cooldown_ladder=cooldown_ladder,
+                )
+                if isinstance(state, dict):
+                    timeout_count = max(1, int(state["timeout_count"]))
+                    cooldown = float(state["cooldown_seconds"])
+                    self._consecutive_timeout_failures = timeout_count
+                    self._summary_failure_cooldown_until = time.monotonic() + cooldown
+                    self._last_summary_error = error
+                    self._cooldown_persist_failed = False
+                    return cooldown
+            except sqlite3.Error as exc:
+                logger.debug("compression timeout persist failed: %s", exc)
+            except Exception as exc:
+                logger.debug(
+                    "compression timeout persist failed (non-sqlite): %s", exc
+                )
+
         self._consecutive_timeout_failures = (
             getattr(self, "_consecutive_timeout_failures", 0) + 1
         )
-        cooldown = _TIMEOUT_COOLDOWN_LADDER[
-            min(self._consecutive_timeout_failures,
-                len(_TIMEOUT_COOLDOWN_LADDER)) - 1
-        ]
-        self._record_compression_failure_cooldown(float(cooldown), error)
+        cooldown = float(
+            cooldown_ladder[
+                min(self._consecutive_timeout_failures, len(cooldown_ladder)) - 1
+            ]
+        )
+        self._record_compression_failure_cooldown(cooldown, error)
+        return cooldown
 
     def _clear_compression_failure_cooldown(self) -> None:
         # #76354 review F4: fence check BEFORE cooldown-clear. A late worker
@@ -5245,23 +5273,21 @@ This compaction should PRIORITISE preserving all information related to the focu
             # a "timed out" error also matches _is_connection_error, but a
             # deadline exhaustion is the structural repeat-offender class,
             # not a transient mid-stream drop.
-            if _is_timeout:
-                self._consecutive_timeout_failures = (
-                    getattr(self, "_consecutive_timeout_failures", 0) + 1
-                )
-                _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
-                _transient_cooldown = _TIMEOUT_COOLDOWN_LADDER[
-                    min(self._consecutive_timeout_failures,
-                        len(_TIMEOUT_COOLDOWN_LADDER)) - 1
-                ]
-            elif _is_json_decode or _is_streaming_closed or _is_empty_content:
-                _transient_cooldown = 30
-            else:
-                _transient_cooldown = 60
             err_text = str(e).strip() or e.__class__.__name__
             if len(err_text) > 220:
                 err_text = err_text[:217].rstrip() + "..."
-            self._record_compression_failure_cooldown(_transient_cooldown, err_text)
+            if _is_timeout:
+                _transient_cooldown = self.record_timeout_failure(err_text)
+            elif _is_json_decode or _is_streaming_closed or _is_empty_content:
+                _transient_cooldown = 30.0
+                self._record_compression_failure_cooldown(
+                    _transient_cooldown, err_text
+                )
+            else:
+                _transient_cooldown = 60.0
+                self._record_compression_failure_cooldown(
+                    _transient_cooldown, err_text
+                )
             self._last_summary_error = err_text
             # A terminal connection/network failure or empty-content response
             # from a degraded provider (we reach this branch only after any

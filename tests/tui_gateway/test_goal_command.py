@@ -256,6 +256,58 @@ def test_pending_input_commands_includes_goal(server):
 # ── active-goal recovery after compression exhaustion ───────────────
 
 
+def test_real_user_turn_reopens_done_goal_before_judging(
+    server, turn_env, monkeypatch
+):
+    """A follow-up in a Goal-bound Desktop session stays governed.
+
+    ``done`` ends autonomous continuation, but it must not permanently detach
+    later real user work in the same session from Goal completion and
+    compression recovery controls.
+    """
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    session_key = "goal-user-followup"
+    mgr = GoalManager(session_key)
+    mgr.set("ship and verify the feature", max_turns=12)
+    mgr.mark_done("initial delivery claim")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"goals": {"max_turns": 1000}})
+
+    def run_conversation(_message, **_kwargs):
+        admitted = GoalManager(session_key).state
+        assert admitted is not None
+        assert admitted.status == "active"
+        assert admitted.max_turns == 1000
+        return {"final_response": "fresh verification evidence"}
+
+    agent = types.SimpleNamespace(
+        session_id=session_key,
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+    )
+    session = _turn_session(agent, session_key)
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: (
+            "done",
+            "fresh evidence satisfies the goal",
+            False,
+            None,
+            False,
+        ),
+    )
+
+    server._run_prompt_submit("rid", "sid", session, "is it actually finished?")
+
+    state = GoalManager(session_key).state
+    assert state is not None
+    assert state.status == "done"
+    assert state.turns_used == 1
+    assert state.max_turns == 1000
+
+
 def test_active_goal_retries_once_without_judging_failed_turn(
     server, turn_env, monkeypatch
 ):

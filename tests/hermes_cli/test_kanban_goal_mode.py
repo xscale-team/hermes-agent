@@ -128,6 +128,27 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def test_blocked_judge_blocks_card_without_spending_more_turns(monkeypatch):
+    _patch_judge(monkeypatch, ["blocked"])
+    turns = []
+    blocks = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-blocked",
+        goal_text="complete an external approval",
+        run_turn=lambda prompt: turns.append(prompt) or "still blocked",
+        task_status_fn=lambda: "running",
+        block_fn=blocks.append,
+        first_response="needs user approval",
+        max_turns=900,
+    )
+
+    assert res["outcome"] == "blocked_by_worker"
+    assert res["turns_used"] == 1
+    assert turns == []
+    assert blocks == ["Goal judge blocked: scripted:blocked"]
+
+
 
 
 

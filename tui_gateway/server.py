@@ -11449,7 +11449,13 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                             return
                         session["running"] = True
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, payload["message"])
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        payload["message"],
+                        user_initiated=False,
+                    )
                     return
             except Exception:
                 pass
@@ -11458,7 +11464,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, wakeup)
+        _run_prompt_submit(rid, sid, session, wakeup, user_initiated=False)
     except Exception as exc:
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
@@ -11696,7 +11702,13 @@ def _notification_poller_loop(
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            "\n".join(_batch),
+                            user_initiated=False,
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -11790,9 +11802,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    user_initiated=False,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, user_initiated=False
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -11868,9 +11883,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    user_initiated=False,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, user_initiated=False
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -12208,7 +12226,35 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    user_initiated: bool = True,
 ) -> bool:
+    # A real follow-up in a Goal-bound session must regain Goal protection
+    # before the agent runs.  Doing this only in the post-turn judge is too
+    # late for compression recovery during the admitted turn.
+    if user_initiated:
+        try:
+            from hermes_cli.goals import GoalManager
+
+            _goal_session_key = session.get("session_key") or ""
+            if _goal_session_key:
+                try:
+                    _goal_max_turns = int(
+                        ((_load_cfg().get("goals") or {}).get("max_turns", 20))
+                        or 20
+                    )
+                except Exception:
+                    _goal_max_turns = 20
+                GoalManager(
+                    _goal_session_key,
+                    default_max_turns=_goal_max_turns,
+                ).reactivate_for_user_turn()
+        except Exception as _goal_admission_exc:
+            print(
+                f"[tui_gateway] goal user-turn admission failed: "
+                f"{type(_goal_admission_exc).__name__}: {_goal_admission_exc}",
+                file=sys.stderr,
+            )
+
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -12860,7 +12906,7 @@ def _run_prompt_submit(
                                 _bg_procs = None
                             decision = goal_mgr.evaluate_after_turn(
                                 raw,
-                                user_initiated=True,
+                                user_initiated=user_initiated,
                                 background_processes=_bg_procs,
                             )
                             verdict_msg = decision.get("message") or ""
@@ -13111,7 +13157,13 @@ def _run_prompt_submit(
                 session["running"] = True
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    goal_followup,
+                    user_initiated=False,
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -13157,7 +13209,13 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        user_initiated=False,
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
